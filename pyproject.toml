@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "multi-agent-moderator-mcp"
+version = "0.1.0"
+description = "Moderator MCP Server - manage multiple remote AI agents from one Claude Code session"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "TBD" }
+authors = [
+    { name = "Clark Lin" },
+]
+dependencies = [
+    "mcp>=1.0",
+    "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+moderator = "moderator.cli:main"
+moderator-mcp = "moderator.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/moderator"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"

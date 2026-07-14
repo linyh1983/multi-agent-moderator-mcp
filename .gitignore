@@ -26,3 +26,5 @@ moderator.log
 # Local Claude Code configs (user-specific, not for commit)
 .claude/
 .claude.json
+.agents/
+skills-lock.json
