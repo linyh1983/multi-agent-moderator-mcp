@@ -298,23 +298,7 @@
 
 ---
 
-## 9. 交叉引用
-
-- `docs/adr/0006-marker-protocol-text-tags.md` —— ✅ **主计划 locked decision 转 ADR（已补）**
-- `docs/adr/0007-moderator-writeback-protocol.md` —— 写回协议（待写）
-- `docs/adr/0008-agent-lifecycle-states.md` —— ✅ **第 2 轮已写**
-- `docs/adr/0009-approval-queue-semantics.md` —— ✅ **第 4 轮已写**
-- `docs/adr/0010-marker-routing-edge-cases.md` —— ✅ **第 3 轮已写**
-- `docs/adr/0011-multi-moderator-v1-singularity.md` —— ✅ **第 5 轮已写**
-- `docs/adr/0012-state-file-not-encrypted.md` —— ✅ **第 5 轮已写**
-- `docs/adr/0013-marker-rate-handling.md` —— ✅ **第 5 轮已写**
-- `docs/adr/0014-state-schema-v1-reconciliation.md` —— ✅ **第 7 轮已写**
-- `docs/adr/0015-ssh-fingerprint-tofu.md` —— ✅ **第 7 轮已写**
-- `docs/adr/0016-schema-version-migrations.md` —— ✅ **第 7 轮已写**
-
----
-
-## 10. 踩过的坑（Gotchas）
+## 9. 踩过的坑（Gotchas）
 
 实现过程中真正浪费过时间的陷阱，写在 `docs/gotchas.md`。
 每条 gotcha 都附 **symptom / root cause / fix / discovered-in** 四段，
@@ -331,4 +315,19 @@
 
 写新坑之前先 grep 一下这里；新坑的"如果它泛化"就升级成 ADR。
 
+---
+
+## 10. 交叉引用
+
+- `docs/adr/0006-marker-protocol-text-tags.md` —— ✅ **主计划 locked decision 转 ADR（已补）**
+- `docs/adr/0007-moderator-writeback-protocol.md` —— 写回协议（待写）
+- `docs/adr/0008-agent-lifecycle-states.md` —— ✅ **第 2 轮已写**
+- `docs/adr/0009-approval-queue-semantics.md` —— ✅ **第 4 轮已写**
+- `docs/adr/0010-marker-routing-edge-cases.md` —— ✅ **第 3 轮已写**
+- `docs/adr/0011-multi-moderator-v1-singularity.md` —— ✅ **第 5 轮已写**
+- `docs/adr/0012-state-file-not-encrypted.md` —— ✅ **第 5 轮已写**
+- `docs/adr/0013-marker-rate-handling.md` —— ✅ **第 5 轮已写**
+- `docs/adr/0014-state-schema-v1-reconciliation.md` —— ✅ **第 7 轮已写**
+- `docs/adr/0015-ssh-fingerprint-tofu.md` —— ✅ **第 7 轮已写**
+- `docs/adr/0016-schema-version-migrations.md` —— ✅ **第 7 轮已写**
 - `docs/adr/0017-no-auto-restart-on-offline.md` —— ✅ **第 6 轮已写**
