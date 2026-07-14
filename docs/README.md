@@ -14,6 +14,7 @@
 docs/
 ├── README.md           ← 本文件（索引）
 ├── glossary.md         ← 通用语言（角色、协议、审批、生命周期、横切、schema）
+├── spec-v1.md          ← v1 行为规格（/to-spec 产物）
 └── adr/
     ├── 0001-...md      ← ADR 元模板（"我们用 ADR"）
     ├── 0002-...md      ← 主计划 locked decisions（stdio / SSH+tmux / marker）
@@ -160,6 +161,7 @@ docs/
 
 ## 相关
 
+- **v1 行为规格** [`spec-v1.md`](./spec-v1.md) —— 75 条 user stories + Implementation Decisions + Testing Decisions + Out of Scope + tracer bullet 顺序建议（`/to-spec` 产物）。
 - **项目根 `README.md`**：用户视角的安装 / 协作模型 / 工具列表 / 安全声明 / 已知软肋。
 - **主计划** `~/.claude/plans/requirement-txt-atomic-canyon.md`：实施里程碑 + Locked Architectural Decisions 表（已加 ADR 编号列）+ Open Items（已压到 ≤2 项）。
 - **`REQUIREMENT.txt`**：需求意图真源；每个 ADR 的 Context 节都引用它。
