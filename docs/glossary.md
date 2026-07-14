@@ -311,4 +311,24 @@
 - `docs/adr/0014-state-schema-v1-reconciliation.md` —— ✅ **第 7 轮已写**
 - `docs/adr/0015-ssh-fingerprint-tofu.md` —— ✅ **第 7 轮已写**
 - `docs/adr/0016-schema-version-migrations.md` —— ✅ **第 7 轮已写**
+
+---
+
+## 10. 踩过的坑（Gotchas）
+
+实现过程中真正浪费过时间的陷阱，写在 `docs/gotchas.md`。
+每条 gotcha 都附 **symptom / root cause / fix / discovered-in** 四段，
+并指向对应的 ADR（如果有的话）。新坑一律 append，不改写历史。
+
+当前条目：
+
+- **G-001** — `msvcrt.locking` 不能跨进程阻塞，用 atomic-take-lockfile（ADR-0004）。
+- **G-002** — 同进程内 `with state_lock(): write_state()` 自死锁。
+- **G-003** — Windows `spawn` 启动慢，跨进程测试用 ready-file 同步，别 fixed sleep。
+- **G-004** — MCP Python SDK stdio 走 NDJSON，不是 LSP 的 `Content-Length:` 帧。
+- **G-005** — Pydantic `extra="forbid"` 意味着字段名必须严格匹配 schema。
+- **G-006** — PowerShell `git -m @'...'@` 把字面 `@'` 塞进 commit subject，用 `git -F - <<EOF` 走 stdin。
+
+写新坑之前先 grep 一下这里；新坑的"如果它泛化"就升级成 ADR。
+
 - `docs/adr/0017-no-auto-restart-on-offline.md` —— ✅ **第 6 轮已写**
