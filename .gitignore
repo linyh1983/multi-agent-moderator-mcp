@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# State and runtime artifacts
+moderator_state.json
+moderator_state.json.bak
+moderator_state.lock
+moderator_state.corrupt-*.json
+moderator.log
+
+# Local scratch state dirs (used by smoke_M*.py)
+.test-state*/
+
+# Local Claude Code configs (user-specific, not for commit)
+.claude/
+.claude.json
