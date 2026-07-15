@@ -57,6 +57,7 @@ class AgentRecord(BaseModel):
     state: AgentState = AgentState.STARTING
     started_at: datetime | None = None
     last_output_at: datetime | None = None
+    stopped_at: datetime | None = None
     log_offset: int = 0
     error: str | None = None
     last_error: str | None = None

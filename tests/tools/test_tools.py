@@ -97,10 +97,16 @@ def test_call_tool_unknown_name_returns_error() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_check_against_empty_state_returns_empty_state_one_liner() -> None:
+def test_check_against_empty_state_mentions_no_agents() -> None:
+    """Ticket 03: check() now renders a real 4-section snapshot.
+    The empty-state contract is "no agents" appears in the
+    ``## Agents`` section so the moderator knows what to do next."""
     result = _run(call_tool("check", {}))
     assert result.isError is False
-    assert result.content[0].text == "(no agents; use start_session to begin)"
+    text = result.content[0].text
+    assert "## Agents" in text
+    assert "no agents" in text
+    assert "start_session" in text
 
 
 def test_check_against_state_with_agents_mentions_them() -> None:
@@ -262,7 +268,6 @@ def test_start_session_unsafe_name_returns_clean_error(name: str) -> None:
         ("approve", {"action_ids": ["a-1"]}),
         ("reject", {"action_ids": ["a-1"], "reason": "nope"}),
         ("cue", {"target": "coder-1", "message": "ping"}),
-        ("stop_session", {"name": "coder-1"}),
     ],
 )
 def test_stub_tools_return_not_implemented(tool: str, args: dict) -> None:
@@ -270,4 +275,15 @@ def test_stub_tools_return_not_implemented(tool: str, args: dict) -> None:
     assert result.isError is True
     text = result.content[0].text
     assert "not implemented" in text
+    assert "Traceback" not in text
+
+
+def test_stop_session_against_empty_state_returns_clean_error() -> None:
+    """stop_session is no longer a stub (ticket 03). It returns a
+    clean error when the agent doesn't exist rather than crashing
+    or saying 'not implemented'."""
+    result = _run(call_tool("stop_session", {"name": "coder-1"}))
+    assert result.isError is True
+    text = result.content[0].text
+    assert "no such agent" in text
     assert "Traceback" not in text

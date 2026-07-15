@@ -176,7 +176,11 @@ def test_serve_check_returns_empty_state_one_liner(serve_proc) -> None:
     assert "result" in resp, f"error response: {resp}"
     content = resp["result"]["content"]
     assert len(content) == 1
-    assert content[0]["text"] == "(no agents; use start_session to begin)"
+    # Ticket 03: empty state now renders the new "## Agents" section
+    # with a "(no agents; use start_session to begin)" line inside it.
+    text = content[0]["text"]
+    assert "## Agents" in text
+    assert "no agents" in text
     assert resp["result"].get("isError") is False
 
 
