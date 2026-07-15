@@ -33,6 +33,8 @@ process model that's out of scope for the ticket.
 
 from __future__ import annotations
 
+import hashlib
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from uuid import uuid4
@@ -48,7 +50,12 @@ from moderator.core.models import (
     _utc_now_naive,
 )
 from moderator.drivers import DriverError, TmuxDriver
-from moderator.markers import MarkerEvent, MarkerKind, MarkerParser
+from moderator.markers import (
+    MAX_MARKER_BYTES,
+    MarkerEvent,
+    MarkerKind,
+    MarkerParser,
+)
 from moderator.state.store import read_state, write_state
 
 
@@ -69,6 +76,17 @@ _DEFAULT_STUCK_THRESHOLD_SECONDS: float = 30 * 60.0
 # runtime agree.
 _OFFLINE_RETRY_THRESHOLD: int = 2
 
+# Dedup FIFO cap (ADR-0013 §5.4): how many marker sha256s we
+# retain in ``state.seen_marker_hashes`` per moderator process.
+# Newest 5000 hashes win; the oldest is evicted FIFO-style.
+_DEDUP_FIFO_CAP: int = 5000
+
+# Default per-agent marker rate limit (ADR-0013 §5.4). A burst
+# above this triggers ``time.sleep`` between dispatches so a
+# single runaway agent can't flood the moderator. Set to 0 to
+# disable (used by tests).
+_DEFAULT_MARKER_RATE_LIMIT_PER_SECOND: float = 10.0
+
 # In-memory per-agent consecutive is_alive() failure counter.
 # Module-level so process_agent (which is stateless) can share
 # the counter across cycles. Tests reset via
@@ -76,6 +94,12 @@ _OFFLINE_RETRY_THRESHOLD: int = 2
 # uses the same dict. Lost on process restart — acceptable
 # per ADR-0017 (no auto-restart, moderator decides).
 _offline_failure_count: dict[str, int] = {}
+
+# In-memory per-agent monotonic clock of the last marker
+# dispatch. Used to enforce the per-agent rate limit
+# (ADR-0013 §5.4). Lost on restart — the worker rebuilds it
+# from the next cycle's events naturally.
+_last_dispatch_mono: dict[str, float] = {}
 
 
 def reset_health_counters() -> None:
@@ -88,6 +112,15 @@ def reset_health_counters() -> None:
     _offline_failure_count.clear()
 
 
+def reset_dispatch_clock() -> None:
+    """Clear the in-memory per-agent last-dispatch monotonic clock.
+
+    Tests call this in teardown so a previous test's rate-limit
+    state does not slow down the next test.
+    """
+    _last_dispatch_mono.clear()
+
+
 @dataclass
 class WorkerConfig:
     """Per-process tuning."""
@@ -97,6 +130,10 @@ class WorkerConfig:
     # ADR-0008 §2.2: gap in stdout bytes that flips running → stuck
     # when the tmux session is still alive.
     stuck_threshold_seconds: float = _DEFAULT_STUCK_THRESHOLD_SECONDS
+    # ADR-0013 §5.4: per-agent marker rate limit. 0 disables
+    # throttling entirely (the test default). Production wires
+    # this to 10.0 via run_forever's default config.
+    marker_rate_limit_per_second: float = 0.0
 
 
 @dataclass
@@ -208,13 +245,37 @@ def process_agent(
     events = parser.feed(text)
     for ev in events:
         stats.events.append(ev)
+
+        # Per-agent rate limit (ADR-0013 §5.4). Measured per
+        # event dispatch — applies even to duplicates and
+        # parse-warnings because they still cost parser + write
+        # cycles. The clock is module-local; it survives across
+        # ``process_agent`` calls in this process.
+        _enforce_rate_limit(name, config)
+
+        # Dedup (ADR-0013 §5.4 / ADR-0014 §7.6). The dedup
+        # FIFO is keyed by sha256(opener+content+closer). A
+        # duplicate marker is silently dropped — no state
+        # mutation, no chat, no writeback.
+        if _check_dedup(state, ev):
+            continue
+
         if ev.kind is MarkerKind.PROGRESS and not ev.warning:
             state.progress.setdefault(name, []).append(
                 ProgressEntry(ts=_utc_now_naive(), text=ev.content)
             )
             stats.progress_written += 1
+            # ADR-0010 §3.6: a truncated body still receives an
+            # ack so the sender can downsize on the next try.
+            if ev.truncated:
+                opener, _ = _opener_and_closer(ev)
+                _send_ack_safely(session, _truncated_ack(opener), tmux)
         elif ev.kind is MarkerKind.PARSE_WARNING:
             stats.parse_warnings += 1
+            detail = ev.detail or "unknown parse warning"
+            _send_ack_safely(
+                session, _parse_warning_ack(detail), tmux
+            )
         elif ev.kind is MarkerKind.REQUEST_EXEC and not ev.warning:
             # Dispatch may have replaced ``state.agents[name]``
             # with a new record (e.g. running → blocked). Re-bind
@@ -223,11 +284,23 @@ def process_agent(
             record = _handle_request_exec(
                 state, record, ev.content, session, tmux
             )
+            if ev.truncated:
+                opener, _ = _opener_and_closer(ev)
+                _send_ack_safely(session, _truncated_ack(opener), tmux)
         elif ev.kind is MarkerKind.TO and not ev.warning:
             record = _handle_to_marker(
                 state, record, ev.target, ev.content, session, tmux, stats
             )
+            if ev.truncated:
+                opener, _ = _opener_and_closer(ev)
+                _send_ack_safely(session, _truncated_ack(opener), tmux)
         # HELP lands in a later ticket.
+
+        # Record the hash AFTER dispatch so the same dispatch
+        # succeeds on the first sighting and is dropped on
+        # subsequent ones. New entries push older ones out of
+        # the FIFO when the cap is reached.
+        _record_marker_hash(state, ev)
 
     state.agents[name] = record
     write_state(state)
@@ -314,6 +387,7 @@ __all__ = [
     "process_agent",
     "run_forever",
     "reset_health_counters",
+    "reset_dispatch_clock",
 ]
 
 
@@ -328,7 +402,9 @@ def run_forever(
     """
     import time
 
-    cfg = config or WorkerConfig()
+    cfg = config or WorkerConfig(
+        marker_rate_limit_per_second=_DEFAULT_MARKER_RATE_LIMIT_PER_SECOND,
+    )
     while True:
         state = read_state()
         for name in list(state.agents.keys()):
@@ -431,6 +507,106 @@ def _parse_warning_ack(detail: str) -> str:
 def _undelivered_ack(target: str) -> str:
     """Compose an undelivered writeback tag (ADR-0010)."""
     return f'<moderator-info kind="undelivered" target="{target}">'
+
+
+def _truncated_ack(opener_text: str) -> str:
+    """Compose a truncated-marker writeback tag (ADR-0010 §3.6).
+
+    Emitted when a marker's body was capped at 64 KiB so the
+    sender can downsize on the next attempt."""
+    safe = opener_text.replace('"', "'")
+    return f'<moderator-info kind="truncated" marker="{safe}">'
+
+
+def _opener_and_closer(ev: MarkerEvent) -> tuple[str, str]:
+    """Reconstruct the literal opener+closer text from a parsed
+    :class:`MarkerEvent`.
+
+    Used by the dedup hash so identical markers are detected
+    even when the parser has stripped them down to ``content``.
+    """
+    if ev.kind is MarkerKind.TO:
+        target = ev.target or ""
+        return (
+            f"【TO:{target}】",
+            f"【/TO:{target}】",
+        )
+    if ev.kind is MarkerKind.PROGRESS:
+        return ("【进度汇报】", "【/进度汇报】")
+    if ev.kind is MarkerKind.REQUEST_EXEC:
+        return ("【申请执行】", "【/申请执行】")
+    if ev.kind is MarkerKind.HELP:
+        return ("【求助人类】", "【/求助人类】")
+    # PARSE_WARNING has no canonical opener; use an empty
+    # string so the hash is deterministic and distinct from
+    # real markers.
+    return ("", "")
+
+
+def _compute_marker_hash(ev: MarkerEvent) -> str:
+    """Return sha256(opener+content+closer) hex digest.
+
+    ADR-0013 §5.4 dedup invariant: identical input bytes yield
+    identical hashes. PARSE_WARNING events return a hash of
+    the detail field instead — same shape, distinct namespace.
+    """
+    if ev.kind is MarkerKind.PARSE_WARNING:
+        payload = (ev.detail or "") + "\x00warning"
+    else:
+        opener, closer = _opener_and_closer(ev)
+        payload = opener + ev.content + closer
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _check_dedup(
+    state: ModeratorState, ev: MarkerEvent
+) -> bool:
+    """Return True if ``ev`` is a duplicate (already in
+    ``state.seen_marker_hashes``). The dispatcher skips
+    duplicates silently. PARSE_WARNING events are exempt:
+    the same warning can legitimately fire multiple times
+    (e.g. each cycle that re-encounters a partial buffer
+    overflow) and must not be silently suppressed."""
+    if ev.kind is MarkerKind.PARSE_WARNING:
+        return False
+    h = _compute_marker_hash(ev)
+    return h in state.seen_marker_hashes
+
+
+def _record_marker_hash(
+    state: ModeratorState, ev: MarkerEvent
+) -> None:
+    """Append the hash to ``state.seen_marker_hashes`` and evict
+    the oldest entries FIFO-style once the cap is exceeded
+    (ADR-0013 §5.4: 5000-entry cap, oldest evicted first).
+    PARSE_WARNING events are exempt from the dedup ledger —
+    see :func:`_check_dedup` for the rationale."""
+    if ev.kind is MarkerKind.PARSE_WARNING:
+        return
+    h = _compute_marker_hash(ev)
+    state.seen_marker_hashes.append(h)
+    overflow = len(state.seen_marker_hashes) - _DEDUP_FIFO_CAP
+    if overflow > 0:
+        del state.seen_marker_hashes[:overflow]
+
+
+def _enforce_rate_limit(
+    name: str, config: WorkerConfig
+) -> None:
+    """Sleep until ``1 / marker_rate_limit_per_second`` seconds
+    have passed since this agent's last dispatch (ADR-0013
+    §5.4). When the limit is 0 the function is a no-op so tests
+    stay fast."""
+    if config.marker_rate_limit_per_second <= 0:
+        return
+    gap = 1.0 / config.marker_rate_limit_per_second
+    now_mono = time.monotonic()
+    last = _last_dispatch_mono.get(name)
+    if last is not None:
+        elapsed = now_mono - last
+        if elapsed < gap:
+            time.sleep(gap - elapsed)
+    _last_dispatch_mono[name] = time.monotonic()
 
 
 def _handle_to_marker(
