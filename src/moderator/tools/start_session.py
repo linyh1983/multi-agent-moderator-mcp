@@ -1,22 +1,27 @@
-"""``start_session`` MCP tool (ticket 02).
+"""``start_session`` MCP tool (ticket 02; ticket 05 extends it).
 
 Flow:
 
 1. Validate inputs.
-2. Acquire the process driver pair (default: :class:`LocalExecutor`).
-3. Stage ``role_prompt`` to a temp file on the moderator host
+2. **Same-name reject** (ADR-0005 §6.5): if ``state.agents`` already
+   contains ``name``, return ``AgentAlreadyExists`` and DO NOT
+   touch state.
+3. Acquire the process driver pair (default: :class:`LocalExecutor`).
+4. Stage ``role_prompt`` to a temp file on the moderator host
    (never persisted into state.json — only the path is).
-4. SFTP it to ``/tmp/moderator/role-<name>.txt`` on the agent host.
-5. Create a tmux session ``mod-<name>`` that runs ``claude`` with
+5. SFTP it to ``/tmp/moderator/role-<name>.txt`` on the agent host.
+6. Create a tmux session ``mod-<name>`` that runs ``claude`` with
    the role prompt piped in. Per ADR-0003 the agent process owns
    its role; the moderator never embeds role text in state.
-6. Update ``state.agents[name]``:
+7. Update ``state.agents[name]``:
    - ``role_prompt_path`` set to the remote path.
    - ``tmux_session`` set to ``mod-<name>``.
    - ``state`` transitions STARTING → RUNNING.
    - ``started_at``, ``last_output_at`` set to now (UTC, naive).
    - ``log_offset`` initialized to 0.
-7. On any failure: write an error record with a descriptive
+   - ``additional_agents`` recorded verbatim from the call (ADR-0005
+     §6.2 one-way allowlist).
+8. On any failure: write an error record with a descriptive
    ``error`` string. role_prompt text never appears in state.
 
 Driver injection:
@@ -51,7 +56,9 @@ TOOL = Tool(
         "Start a remote agent session. Validates inputs, stages the role "
         "prompt on the agent host, and creates a tmux session 'mod-<name>' "
         "running the agent. On success the state transitions "
-        "starting → running within the same call."
+        "starting → running within the same call. Same-name reuse "
+        "(any host, any state) returns AgentAlreadyExists "
+        "(ADR-0005 §6.5)."
     ),
     inputSchema={
         "type": "object",
@@ -74,17 +81,13 @@ TOOL = Tool(
             },
             "additional_agents": {
                 "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string"},
-                        "host": {"type": "string"},
-                        "role_prompt": {"type": "string"},
-                    },
-                    "required": ["name", "host", "role_prompt"],
-                    "additionalProperties": False,
-                },
-                "description": "Peer agents to spawn alongside.",
+                "items": {"type": "string"},
+                "description": (
+                    "Peer agent names this agent accepts messages from. "
+                    "One-way allowlist (ADR-0005 §6.2): only agents in "
+                    "this list can TO: this one."
+                ),
+                "default": [],
             },
         },
         "required": ["name", "host", "project_dir", "role_prompt"],
@@ -179,6 +182,7 @@ async def _start_one(
     host: str,
     project_dir: str,
     role_prompt: str,
+    additional_agents: list[str],
     ssh: SshDriver,
     tmux: TmuxDriver,
 ) -> None:
@@ -221,6 +225,7 @@ async def _start_one(
             started_at=now,
             last_output_at=now,
             log_offset=0,
+            additional_agents=list(additional_agents),
         )
         write_state(state)
     finally:
@@ -239,6 +244,7 @@ async def handle(arguments: dict[str, Any]) -> CallToolResult:
     host = arguments.get("host")
     project_dir = arguments.get("project_dir")
     role_prompt = arguments.get("role_prompt")
+    additional_agents = arguments.get("additional_agents", []) or []
 
     if not (name and host and project_dir and role_prompt):
         missing = [
@@ -247,6 +253,13 @@ async def handle(arguments: dict[str, Any]) -> CallToolResult:
             if not arguments.get(k)
         ]
         return make_error(f"start_session: missing required args: {missing}")
+
+    if not isinstance(additional_agents, list) or not all(
+        isinstance(a, str) for a in additional_agents
+    ):
+        return make_error(
+            "start_session: 'additional_agents' must be a list of agent names"
+        )
 
     # Defensive: name must be a safe shell identifier so it can be
     # embedded in tmux session names and remote paths. ADR-0008
@@ -263,6 +276,16 @@ async def handle(arguments: dict[str, Any]) -> CallToolResult:
             reason=reason,
         )
         return make_error(reason)
+
+    # ADR-0005 §6.5: same-name reject. Check BEFORE acquiring drivers
+    # so we don't side-effect (tmux session creation, file put)
+    # when the call is going to fail anyway.
+    existing = read_state().agents.get(name)
+    if existing is not None:
+        return make_error(
+            f"AgentAlreadyExists(name={name!r}, host={existing.host!r}, "
+            f"state={existing.state.value!r})"
+        )
 
     try:
         ssh, tmux = get_drivers()
@@ -282,6 +305,7 @@ async def handle(arguments: dict[str, Any]) -> CallToolResult:
             host=host,
             project_dir=project_dir,
             role_prompt=role_prompt,
+            additional_agents=additional_agents,
             ssh=ssh,
             tmux=tmux,
         )

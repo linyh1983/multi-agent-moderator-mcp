@@ -1,4 +1,5 @@
-"""Worker poll loop (ticket 02 — Hello Agent minimal).
+"""Worker poll loop (ticket 02 — Hello Agent minimal; tickets 04 + 05
+extended it).
 
 The worker is the async loop that:
 
@@ -8,9 +9,9 @@ The worker is the async loop that:
 3. Updates ``last_output_at`` on any byte read (per ADR-0008
    §2.2 — sticky to stdout bytes, not marker bytes).
 4. Feeds the new bytes to a per-agent :class:`MarkerParser`.
-5. Dispatches the resulting events: PROGRESS (ticket 02) and
-   REQUEST_EXEC (ticket 04) are wired; TO/HELP land in later
-   tickets.
+5. Dispatches the resulting events: PROGRESS (ticket 02),
+   REQUEST_EXEC (ticket 04), and TO (ticket 05) are wired; HELP
+   lands in a later ticket.
 6. Writes ``ProgressEntry`` records to ``state.progress[name]``
    (no cap yet — ticket 07 adds the FIFO 50).
 
@@ -24,12 +25,14 @@ process model that's out of scope for the ticket.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from uuid import uuid4
 
 from moderator.core.lifecycle import transition
 from moderator.core.models import (
     AgentRecord,
     AgentState,
     ApprovalAction,
+    ChatMessage,
     ModeratorState,
     ProgressEntry,
     _utc_now_naive,
@@ -37,6 +40,13 @@ from moderator.core.models import (
 from moderator.drivers import DriverError, TmuxDriver
 from moderator.markers import MarkerEvent, MarkerKind, MarkerParser
 from moderator.state.store import read_state, write_state
+
+
+# Reserved target name. Per ADR-0005 §"TO:moderator 禁" the
+# moderator is never a TO: recipient — agents must use the
+# 【求助人类】 marker instead. Catches typos that would otherwise
+# silently drop the message.
+_FORBIDDEN_TO_TARGET: str = "moderator"
 
 
 @dataclass
@@ -56,6 +66,9 @@ class WorkerStats:
     bytes_read: int = 0
     progress_written: int = 0
     parse_warnings: int = 0
+    to_delivered: int = 0
+    to_parse_warnings: int = 0
+    to_undelivered: int = 0
     last_cycle_at: object | None = None
     events: list[MarkerEvent] = field(default_factory=list)
 
@@ -128,7 +141,11 @@ def process_agent(
             record = _handle_request_exec(
                 state, record, ev.content, session, tmux
             )
-        # TO/HELP land in ticket 05.
+        elif ev.kind is MarkerKind.TO and not ev.warning:
+            record = _handle_to_marker(
+                state, record, ev.target, ev.content, session, tmux, stats
+            )
+        # HELP lands in a later ticket.
 
     state.agents[name] = record
     write_state(state)
@@ -225,6 +242,167 @@ def _handle_request_exec(
     except DriverError:
         pass
 
+    return record
+
+
+def _send_ack_safely(session: str, ack: str, tmux: TmuxDriver) -> None:
+    """Writeback an info tag to the sender's tmux. Driver errors
+    are swallowed — the ack is informational; the canonical
+    record lives in ``state``."""
+    try:
+        tmux.send_keys(session, ack)
+    except DriverError:
+        pass
+
+
+def _parse_warning_ack(detail: str) -> str:
+    """Compose a parse-warning writeback tag (ADR-0010)."""
+    # The detail may include spaces; we keep the tag minimal —
+    # detail text only — so the agent sees a clear, parseable
+    # reason without overflowing its UI.
+    safe = detail.replace('"', "'")
+    return f'<moderator-info kind="parse-warning" detail="{safe}">'
+
+
+def _undelivered_ack(target: str) -> str:
+    """Compose an undelivered writeback tag (ADR-0010)."""
+    return f'<moderator-info kind="undelivered" target="{target}">'
+
+
+def _handle_to_marker(
+    state: ModeratorState,
+    record: AgentRecord,
+    target: str | None,
+    content: str,
+    session: str,
+    tmux: TmuxDriver,
+    stats: WorkerStats,
+) -> AgentRecord:
+    """Route a parsed ``TO:<target>`` marker to a peer.
+
+    Per ADR-0005 §6.2 (one-way allowlist) and ADR-0010 (acks,
+    undelivered, parse-warning, TO:moderator ban):
+
+    - ``TO:moderator`` is forbidden; sender gets a parse-warning
+      ack and no chat entry. (Use 【求助人类】 instead.)
+    - Unknown peer (no ``AgentRecord`` in state) → parse-warning
+      ack mentioning the target.
+    - Allowlist miss: ``target not in state.agents[sender]
+      .additional_agents`` → parse-warning ack. No chat entry.
+    - Target in OFFLINE / STOPPED / ERROR → undelivered ack; a
+      peer chat entry is still written, marked undelivered via
+      ``ChatMessage.metadata`` so downstream tools can see the
+      attempt.
+    - Happy path: deliver the body to the peer's tmux stdin AND
+      append a peer :class:`ChatMessage` to ``state.chat``.
+
+    Returns the (unchanged) record — TO does not touch lifecycle.
+    """
+    if target is None:
+        # Parser invariant violation: TO without a target name
+        # should never reach the dispatcher. Be defensive: emit
+        # a parse-warning and skip.
+        stats.to_parse_warnings += 1
+        _send_ack_safely(
+            session, _parse_warning_ack("malformed TO marker"), tmux
+        )
+        return record
+
+    if target == _FORBIDDEN_TO_TARGET:
+        stats.to_parse_warnings += 1
+        _send_ack_safely(
+            session,
+            _parse_warning_ack(
+                "TO:moderator is forbidden; use 【求助人类】 instead"
+            ),
+            tmux,
+        )
+        return record
+
+    target_record = state.agents.get(target)
+    if target_record is None:
+        stats.to_parse_warnings += 1
+        _send_ack_safely(
+            session,
+            _parse_warning_ack(f"unknown peer {target!r}"),
+            tmux,
+        )
+        return record
+
+    # Allowlist check (ADR-0005 §6.2): one-way. The *recipient*
+    # must list the *sender* in its additional_agents allowlist.
+    if record.name not in target_record.additional_agents:
+        stats.to_parse_warnings += 1
+        _send_ack_safely(
+            session,
+            _parse_warning_ack(
+                f"target {target!r} does not accept messages from "
+                f"{record.name!r} (allowlist miss)"
+            ),
+            tmux,
+        )
+        return record
+
+    # Determine whether the target can actually receive bytes
+    # right now. OFFLINE / STOPPED / ERROR all mean the tmux
+    # session is not (reliably) alive, so we mark undelivered.
+    is_live_state = target_record.state in (
+        AgentState.RUNNING,
+        AgentState.STARTING,
+        AgentState.BLOCKED,
+        AgentState.STUCK,
+    )
+    target_session = target_record.tmux_session or f"mod-{target}"
+    session_alive = is_live_state and tmux.is_alive(target_session)
+
+    # Append a peer chat entry FIRST. The chat log is the
+    # authoritative record; tmux delivery is best-effort.
+    now = _utc_now_naive()
+    chat_meta: dict[str, str | bool] | None = None
+    if not session_alive:
+        chat_meta = {
+            "undelivered": True,
+            "undelivered_reason": target_record.state.value,
+        }
+
+    state.chat.append(
+        ChatMessage(
+            id=f"msg-peer-{uuid4().hex[:12]}",
+            ts=now,
+            kind="peer",
+            from_agent=record.name,
+            to_agent=target,
+            text=content,
+            metadata=chat_meta,
+        )
+    )
+
+    if not session_alive:
+        stats.to_undelivered += 1
+        _send_ack_safely(session, _undelivered_ack(target), tmux)
+        return record
+
+    # Happy path: deliver to the peer's tmux stdin. We send the
+    # body followed by a newline so the agent sees a complete
+    # input. Driver errors collapse to an undelivered ack so the
+    # sender is not left in the dark.
+    try:
+        tmux.send_keys(target_session, content)
+    except DriverError:
+        stats.to_undelivered += 1
+        # Mark the chat entry we just appended as undelivered.
+        state.chat[-1] = state.chat[-1].model_copy(
+            update={
+                "metadata": {
+                    "undelivered": True,
+                    "undelivered_reason": "send_keys failed",
+                }
+            }
+        )
+        _send_ack_safely(session, _undelivered_ack(target), tmux)
+        return record
+
+    stats.to_delivered += 1
     return record
 
 
