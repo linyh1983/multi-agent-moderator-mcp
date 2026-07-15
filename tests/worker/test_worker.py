@@ -94,8 +94,12 @@ def test_process_agent_is_noop_when_session_dead(executor: LocalExecutor) -> Non
         config=WorkerConfig(),
         stats=stats,
     )
+    # The state must NOT have flipped to OFFLINE on a single
+    # is_alive() failure (ADR-0008 §2.4 — one failed poll + one
+    # retry before we mark offline). The cycle is counted, but
+    # the state stays RUNNING.
     assert record.state is AgentState.RUNNING
-    assert stats.cycles == 0  # no cycle counted for a dead session
+    assert stats.cycles == 1
 
 
 def test_process_agent_writes_progress_entry_for_marker(

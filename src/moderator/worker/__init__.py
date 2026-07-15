@@ -1,5 +1,5 @@
-"""Worker poll loop (ticket 02 — Hello Agent minimal; tickets 04 + 05
-extended it).
+"""Worker poll loop (ticket 02 — Hello Agent minimal; tickets 04, 05,
+06 extended it).
 
 The worker is the async loop that:
 
@@ -8,11 +8,20 @@ The worker is the async loop that:
    ``state.agents[name].log_offset``.
 3. Updates ``last_output_at`` on any byte read (per ADR-0008
    §2.2 — sticky to stdout bytes, not marker bytes).
-4. Feeds the new bytes to a per-agent :class:`MarkerParser`.
-5. Dispatches the resulting events: PROGRESS (ticket 02),
+4. **Stuck / offline detection** (ADR-0008 §2.2, §2.4; ADR-0017):
+   - Two consecutive ``is_alive()`` failures flip the agent
+     ``running/blocked/stuck → offline`` and record
+     ``last_error``.
+   - A running agent with ``now - last_output_at >
+     stuck_threshold_seconds`` AND ``is_alive()`` flips to
+     ``stuck``.
+   - Both states self-heal to ``running`` as soon as new bytes
+     arrive (ADR-0008 §2.4 recovery path).
+5. Feeds the new bytes to a per-agent :class:`MarkerParser`.
+6. Dispatches the resulting events: PROGRESS (ticket 02),
    REQUEST_EXEC (ticket 04), and TO (ticket 05) are wired; HELP
    lands in a later ticket.
-6. Writes ``ProgressEntry`` records to ``state.progress[name]``
+7. Writes ``ProgressEntry`` records to ``state.progress[name]``
    (no cap yet — ticket 07 adds the FIFO 50).
 
 Ticket 02 keeps the worker's per-cycle function
@@ -25,6 +34,7 @@ process model that's out of scope for the ticket.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from uuid import uuid4
 
 from moderator.core.lifecycle import transition
@@ -49,13 +59,44 @@ from moderator.state.store import read_state, write_state
 _FORBIDDEN_TO_TARGET: str = "moderator"
 
 
+# Default stuck threshold (ADR-0008 §2.2). 30 minutes of
+# silence + alive session = stuck. Configurable per process
+# via WorkerConfig.stuck_threshold_seconds.
+_DEFAULT_STUCK_THRESHOLD_SECONDS: float = 30 * 60.0
+
+# Offline retry count (ADR-0008 §2.4): one failed poll + one
+# retry → OFFLINE. Module-level constant so tests and the
+# runtime agree.
+_OFFLINE_RETRY_THRESHOLD: int = 2
+
+# In-memory per-agent consecutive is_alive() failure counter.
+# Module-level so process_agent (which is stateless) can share
+# the counter across cycles. Tests reset via
+# :func:`reset_health_counters`; production :func:`run_forever`
+# uses the same dict. Lost on process restart — acceptable
+# per ADR-0017 (no auto-restart, moderator decides).
+_offline_failure_count: dict[str, int] = {}
+
+
+def reset_health_counters() -> None:
+    """Clear the in-memory offline-failure counter dict.
+
+    Intended for test setup / teardown so one test's failure
+    history does not leak into the next. Production code does
+    not need to call this.
+    """
+    _offline_failure_count.clear()
+
+
 @dataclass
 class WorkerConfig:
-    """Per-process tuning. Defaults are MVP-sane; ticket 06 hooks
-    stuck thresholds into here."""
+    """Per-process tuning."""
 
     poll_interval_seconds: float = 2.0
     capture_pane_lines: int = 200
+    # ADR-0008 §2.2: gap in stdout bytes that flips running → stuck
+    # when the tmux session is still alive.
+    stuck_threshold_seconds: float = _DEFAULT_STUCK_THRESHOLD_SECONDS
 
 
 @dataclass
@@ -69,6 +110,9 @@ class WorkerStats:
     to_delivered: int = 0
     to_parse_warnings: int = 0
     to_undelivered: int = 0
+    stuck_transitions: int = 0
+    offline_transitions: int = 0
+    recoveries: int = 0
     last_cycle_at: object | None = None
     events: list[MarkerEvent] = field(default_factory=list)
 
@@ -96,10 +140,31 @@ def process_agent(
         raise KeyError(f"no such agent: {name!r}")
     session = record.tmux_session or f"mod-{name}"
 
-    if not tmux.is_alive(session):
-        # Don't auto-restart; ticket 06 owns offline transitions.
-        # For ticket 02, the test driver keeps the session alive,
-        # so this branch is only hit on explicit test teardown.
+    # ADR-0008 §2.5: error is never self-healing. The worker
+    # does not transition out of error regardless of bytes or
+    # session state. We still want the rest of the cycle to be
+    # safe, so we early-return without polling.
+    if record.state is AgentState.ERROR:
+        return record
+
+    alive = tmux.is_alive(session)
+
+    if alive:
+        # Reset the consecutive-failure counter; the session is
+        # healthy right now. (ADR-0008 §2.4: 1 + 1 retry means we
+        # only flip offline if the session is gone twice in a
+        # row.)
+        _offline_failure_count[name] = 0
+    else:
+        # Session is gone. Bump the counter and decide whether
+        # the loss is durable enough to mark OFFLINE.
+        _offline_failure_count[name] = _offline_failure_count.get(name, 0) + 1
+        record = _maybe_transition_to_offline(
+            state, record, _offline_failure_count[name], stats
+        )
+        state.agents[name] = record
+        write_state(state)
+        stats.cycles += 1
         return record
 
     # Use read_new_bytes (not capture_pane) so the parser sees only
@@ -108,13 +173,30 @@ def process_agent(
     # last call — and would cause every cycle to re-parse the same
     # content and double-count markers.
     new_offset, new_bytes = tmux.read_new_bytes(session, record.log_offset)
+
     if not new_bytes:
+        # No new bytes this cycle. Apply stuck transition if the
+        # silence has exceeded the threshold.
+        record = _maybe_transition_to_stuck(state, record, config, stats)
+        state.agents[name] = record
+        write_state(state)
         stats.cycles += 1
         return record
 
+    # Bytes arrived. This counts as activity regardless of whether
+    # the bytes form a marker (ADR-0008 §2.2).
     stats.bytes_read += len(new_bytes)
     record.last_output_at = _utc_now_naive()
     record.log_offset = new_offset
+    # Self-recovery path: if the agent was stuck or offline
+    # before, this byte read returns it to running. ADR-0008 §2.4
+    # and ADR-0017.
+    if record.state in (AgentState.STUCK, AgentState.OFFLINE):
+        new_record = transition(record, AgentState.RUNNING)
+        new_record.last_error = None  # recovery clears the prior error
+        state.agents[record.name] = new_record
+        record = new_record
+        stats.recoveries += 1
 
     # Dispatch. We construct a fresh parser per cycle for
     # simplicity — the per-agent parser state is owned by the
@@ -151,6 +233,88 @@ def process_agent(
     write_state(state)
     stats.cycles += 1
     return record
+
+
+def _maybe_transition_to_stuck(
+    state: ModeratorState,
+    record: AgentRecord,
+    config: WorkerConfig,
+    stats: WorkerStats,
+) -> AgentRecord:
+    """Apply ``running → stuck`` if the silence threshold is met.
+
+    Per ADR-0008 §2.2: ``now - last_output_at >
+    stuck_threshold_seconds`` AND ``is_alive()`` is True (the
+    caller has already verified liveness). BLOCKED agents are
+    not eligible — the agent is awaiting moderator action, not
+    stuck.
+    """
+    if record.state is not AgentState.RUNNING:
+        return record
+    last = record.last_output_at
+    if last is None:
+        return record
+    # `_utc_now_naive` returns naive UTC; `last` is also naive.
+    gap = _utc_now_naive() - last
+    if gap <= timedelta(seconds=config.stuck_threshold_seconds):
+        return record
+    new_record = transition(record, AgentState.STUCK)
+    state.agents[record.name] = new_record
+    stats.stuck_transitions += 1
+    return new_record
+
+
+def _maybe_transition_to_offline(
+    state: ModeratorState,
+    record: AgentRecord,
+    failure_count: int,
+    stats: WorkerStats,
+) -> AgentRecord:
+    """Apply ``running/blocked/stuck → offline`` if the failure
+    threshold is met.
+
+    Per ADR-0008 §2.4 + ADR-0017: the worker never restarts the
+    session. We only mark the state; recovery is either
+    self-healing (session reappears with bytes) or moderator
+    action (``stop_session`` + ``start_session``).
+    """
+    if record.state is AgentState.OFFLINE:
+        # Already there; nothing to do.
+        return record
+    if record.state not in (
+        AgentState.RUNNING,
+        AgentState.BLOCKED,
+        AgentState.STUCK,
+    ):
+        return record
+    if failure_count < _OFFLINE_RETRY_THRESHOLD:
+        return record
+    new_record = transition(record, AgentState.OFFLINE)
+    # Capture the reason. We don't have rich error info from
+    # is_alive() (a plain bool), so a generic "tmux session not
+    # found" message is what moderators see in state.
+    now = _utc_now_naive()
+    new_record = new_record.model_copy(
+        update={
+            "last_error": (
+                f"is_alive() returned False at {now.isoformat()} "
+                f"(after {_OFFLINE_RETRY_THRESHOLD} consecutive "
+                f"polls)"
+            ),
+        }
+    )
+    state.agents[record.name] = new_record
+    stats.offline_transitions += 1
+    return new_record
+
+
+__all__ = [
+    "WorkerConfig",
+    "WorkerStats",
+    "process_agent",
+    "run_forever",
+    "reset_health_counters",
+]
 
 
 def run_forever(
