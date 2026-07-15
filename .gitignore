@@ -16,12 +16,20 @@ htmlcov/
 # State and runtime artifacts
 moderator_state.json
 moderator_state.json.bak
+moderator_state.json.bk
+moderator_state.json.bak.*
 moderator_state.lock
 moderator_state.corrupt-*.json
 moderator.log
 
 # Local scratch state dirs (used by smoke_M*.py)
 .test-state*/
+
+# LocalExecutor working directory (in-process subprocesses write here)
+.local-exec/
+
+# Local MCP server config (user-specific paths, not for commit)
+.mcp.json
 
 # Local Claude Code configs (user-specific, not for commit)
 .claude/
