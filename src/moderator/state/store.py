@@ -30,6 +30,15 @@ _LOCK_BACKOFF_INITIAL = 0.01
 _LOCK_BACKOFF_MAX = 0.5
 
 
+# Schema-version envelope (ADR-0016). ``MIN_SUPPORTED_SCHEMA_VERSION``
+# is the floor below which :func:`read_state` refuses to load —
+# moderators must run ``python -m state.migrate`` first. Bump
+# the floor whenever a migration step becomes mandatory before
+# load.
+MIN_SUPPORTED_SCHEMA_VERSION: int = 1
+CURRENT_SCHEMA_VERSION: int = 1
+
+
 def default_state_path() -> Path:
     """Return the default state file path, overrideable via env var."""
     override = os.environ.get(STATE_PATH_ENV)
@@ -40,6 +49,17 @@ def default_state_path() -> Path:
 
 class StateCorrupt(Exception):
     """Raised when the state file on disk is unreadable or fails validation."""
+
+
+class StateSchemaTooOld(Exception):
+    """Raised when the state file's ``schema_version`` is below
+    ``MIN_SUPPORTED_SCHEMA_VERSION``. Moderators must run
+    ``python -m state.migrate <path>`` to upgrade.
+
+    Per ADR-0016 the loader refuses to silently migrate on
+    startup — schema changes are moderator-visible so they can
+    audit and roll back.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +209,22 @@ def _read_unlocked(path: Path) -> ModeratorState:
             f"state file at {path} is not valid JSON: {exc}"
         ) from exc
 
+    # ADR-0016: refuse to load below the minimum supported
+    # schema version. Legacy state files (schema_version=0 or
+    # absent) must be migrated first via ``state.migrate``.
+    found_version = data.get("schema_version", 0)
+    try:
+        found_version = int(found_version)
+    except (TypeError, ValueError):
+        found_version = 0
+    if found_version < MIN_SUPPORTED_SCHEMA_VERSION:
+        raise StateSchemaTooOld(
+            f"State schema version {found_version} is below "
+            f"minimum supported version "
+            f"{MIN_SUPPORTED_SCHEMA_VERSION}. "
+            f"Run: python -m state.migrate {path}"
+        )
+
     try:
         return ModeratorState.model_validate(data)
     except ValidationError as exc:
@@ -227,9 +263,12 @@ def _write_unlocked(state: ModeratorState, path: Path) -> None:
 
 
 __all__ = [
+    "CURRENT_SCHEMA_VERSION",
+    "MIN_SUPPORTED_SCHEMA_VERSION",
     "STATE_PATH_ENV",
     "StateCorrupt",
     "StateLock",
+    "StateSchemaTooOld",
     "default_state_path",
     "read_state",
     "state_lock",

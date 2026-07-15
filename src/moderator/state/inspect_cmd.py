@@ -18,6 +18,7 @@ from datetime import datetime
 from typing import Any
 
 from moderator.core.models import ModeratorState, empty_state
+from moderator.state.migrate import migration_suggestion
 from moderator.state.store import default_state_path, read_state
 
 
@@ -131,6 +132,9 @@ def run(
         payload = state.model_dump(mode="json")
         json.dump(payload, sys.stdout, indent=2, ensure_ascii=False)
         sys.stdout.write("\n")
+        hint = migration_suggestion(state, path=path)
+        if hint is not None:
+            sys.stdout.write(f"# {hint}\n")
         return 0
 
     if output_format == "jsonl":
@@ -140,6 +144,16 @@ def run(
         for record in records:
             json.dump(record, sys.stdout, ensure_ascii=False)
             sys.stdout.write("\n")
+        hint = migration_suggestion(state, path=path)
+        if hint is not None:
+            # JSONL requires valid JSON per line; emit the hint
+            # as a final JSON object so downstream jq/grep can
+            # decide to filter or ignore it. Key is ``kind:
+            # migration_hint``.
+            sys.stdout.write(
+                json.dumps({"kind": "migration_hint", "text": hint})
+                + "\n"
+            )
         return 0
 
     sys.stderr.write(f"unknown format: {output_format!r}\n")
