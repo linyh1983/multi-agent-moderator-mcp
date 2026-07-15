@@ -215,9 +215,19 @@ def _render_chat_section(
     for msg in tail:
         sender = msg.from_agent or "system"
         target = msg.to_agent or "all"
+        # ADR-0009 §4.6 reject privacy: a chat entry tagged with
+        # ``private_to_originator`` carries a moderator-only
+        # message (typically a reject reason). Render it as a
+        # redacted placeholder so peer Agents reading the chat
+        # tail don't see the body.
+        body = msg.text
+        meta = msg.metadata or {}
+        private_to = meta.get("private_to_originator")
+        if private_to:
+            body = f"[private: see agent {private_to}]"
         lines.append(
             f"  - {_format_age(msg.ts)} {sender}→{target} "
-            f"({msg.kind}): {msg.text}"
+            f"({msg.kind}): {body}"
         )
     lines.append("")
     return "\n".join(lines)

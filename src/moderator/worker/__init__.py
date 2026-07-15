@@ -8,8 +8,9 @@ The worker is the async loop that:
 3. Updates ``last_output_at`` on any byte read (per ADR-0008
    §2.2 — sticky to stdout bytes, not marker bytes).
 4. Feeds the new bytes to a per-agent :class:`MarkerParser`.
-5. Dispatches the resulting events: for ticket 02 only the
-   ``PROGRESS`` event is wired (others come in later tickets).
+5. Dispatches the resulting events: PROGRESS (ticket 02) and
+   REQUEST_EXEC (ticket 04) are wired; TO/HELP land in later
+   tickets.
 6. Writes ``ProgressEntry`` records to ``state.progress[name]``
    (no cap yet — ticket 07 adds the FIFO 50).
 
@@ -22,16 +23,18 @@ process model that's out of scope for the ticket.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from moderator.core.lifecycle import transition
 from moderator.core.models import (
     AgentRecord,
     AgentState,
+    ApprovalAction,
+    ModeratorState,
     ProgressEntry,
     _utc_now_naive,
 )
-from moderator.drivers import TmuxDriver
+from moderator.drivers import DriverError, TmuxDriver
 from moderator.markers import MarkerEvent, MarkerKind, MarkerParser
 from moderator.state.store import read_state, write_state
 
@@ -117,8 +120,15 @@ def process_agent(
             stats.progress_written += 1
         elif ev.kind is MarkerKind.PARSE_WARNING:
             stats.parse_warnings += 1
-        # Other kinds (TO, REQUEST_EXEC, HELP) are wired in
-        # later tickets.
+        elif ev.kind is MarkerKind.REQUEST_EXEC and not ev.warning:
+            # Dispatch may have replaced ``state.agents[name]``
+            # with a new record (e.g. running → blocked). Re-bind
+            # ``record`` so the writeback at the end uses the
+            # up-to-date copy.
+            record = _handle_request_exec(
+                state, record, ev.content, session, tmux
+            )
+        # TO/HELP land in ticket 05.
 
     state.agents[name] = record
     write_state(state)
@@ -153,6 +163,69 @@ def run_forever(
                 stats=WorkerStats(),
             )
         time.sleep(cfg.poll_interval_seconds)
+
+
+def _handle_request_exec(
+    state: ModeratorState,
+    record: AgentRecord,
+    content: str,
+    session: str,
+    tmux: TmuxDriver,
+) -> AgentRecord:
+    """Materialize a REQUEST_EXEC marker into a pending action.
+
+    Per ADR-0007 §6.1: every REQUEST_EXEC gets a writeback ack
+    ``<moderator-info action-id="a-N" status="queued">``. Per
+    ADR-0009 §4.1: if the agent was running, transition to blocked
+    and record ``waiting_for`` (single-wait invariant). If the
+    agent was already blocked on another action, do NOT re-touch
+    ``waiting_for`` — the new action is queued in state.actions
+    but the agent keeps waiting on the first one.
+
+    Returns the (possibly updated) record so the caller can
+    re-bind ``state.agents[name]`` with the new copy.
+    """
+    state.action_seq += 1
+    seq = state.action_seq
+    aid = f"a-{seq}"
+    action = ApprovalAction(
+        id=aid,
+        seq=seq,
+        agent_name=record.name,
+        content=content,
+        status="pending",
+        created_at=_utc_now_naive(),
+    )
+    state.actions[aid] = action
+
+    if record.state is AgentState.RUNNING:
+        # Pure transition: blocked replaces waiting_for with the
+        # first action. waiting_for assignment happens below.
+        new_record = transition(record, AgentState.BLOCKED)
+        new_record.waiting_for = aid
+        state.agents[record.name] = new_record
+        record = new_record
+    elif record.state is AgentState.BLOCKED:
+        # Single-wait invariant: do NOT re-transition and do NOT
+        # overwrite waiting_for. The new action accumulates in
+        # state.actions.
+        pass
+    else:
+        # Other states (STARTING/STUCK/OFFLINE/STOPPED/ERROR) are
+        # not legal origins for a new request. We still record
+        # the action so the moderator sees it (audit), but we
+        # don't move the agent. v1 ticket 06+ may refine this.
+        pass
+
+    # Send ack writeback. Driver errors are swallowed — the action
+    # is already persisted in state.actions.
+    ack = f'<moderator-info action-id="{aid}" status="queued">'
+    try:
+        tmux.send_keys(session, ack)
+    except DriverError:
+        pass
+
+    return record
 
 
 __all__ = [

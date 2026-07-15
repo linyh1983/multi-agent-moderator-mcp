@@ -61,6 +61,11 @@ class AgentRecord(BaseModel):
     log_offset: int = 0
     error: str | None = None
     last_error: str | None = None
+    # Single-wait invariant (ADR-0009 §4.1): when an agent is
+    # ``blocked``, this is the action_id it is waiting for. ``None``
+    # for any other state. The agent can be unblocked only by an
+    # approve/reject whose id matches this value.
+    waiting_for: str | None = None
     additional_agents: list[str] = Field(default_factory=list)
 
 
