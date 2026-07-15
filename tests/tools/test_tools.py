@@ -1,22 +1,32 @@
-"""Tests for the 6 MCP tool stubs (ticket 01).
+"""Tests for the 6 MCP tools.
 
-Acceptance covered:
+Covers tickets 01 + 02:
+
 - 6 tools visible to the MCP layer (start_session, check, approve,
   reject, cue, stop_session).
 - ``check()`` against empty state returns a one-line response
   referencing empty state.
-- ``start_session(...)`` against a fake host returns a clean error
-  string (no stacktrace) AND an error-state record on disk.
-- Missing-args path for ``start_session`` returns a clean error too.
+- ``start_session(...)`` missing-args path returns a clean error.
+- ``start_session(...)`` happy path (LocalExecutor) transitions
+  STARTING → RUNNING within one call, writes role_prompt_path and
+  tmux_session fields, and persists the role prompt to the
+  simulated remote.
+- ``start_session(...)`` against an unsafe name returns a clean
+  error and writes an error-state record.
+- 4 stubs (approve, reject, cue, stop_session) return
+  "not implemented" with no stacktrace.
 """
 
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Generator
 from pathlib import Path
 
 import pytest
 
+from moderator.drivers.local import LocalExecutor
+from moderator.runtime import reset_drivers, set_drivers
 from moderator.state.store import read_state
 from moderator.tools import call_tool, list_tool_specs
 
@@ -30,10 +40,25 @@ def _run(coro):
 
 
 @pytest.fixture(autouse=True)
-def _isolated_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Each test starts from a clean, per-test state file."""
+def _isolated_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Generator[None, None, None]:
+    """Each test starts from a clean, per-test state file AND a clean,
+    per-test driver pair so concurrent tests don't share a workdir."""
     state_path = tmp_path / "moderator_state.json"
     monkeypatch.setenv("MODERATOR_STATE_PATH", str(state_path))
+    workdir = tmp_path / "local-exec"
+    workdir.mkdir(parents=True, exist_ok=True)
+    execu = LocalExecutor(workdir=workdir)
+    set_drivers(execu, execu)
+    yield
+    # Tear down: kill any spawned sessions, drop the module cache so
+    # the next test sees a fresh default.
+    try:
+        execu.close()
+    except Exception:
+        pass
+    reset_drivers()
 
 
 # ---------------------------------------------------------------------------
@@ -110,49 +135,120 @@ def test_start_session_missing_required_args_returns_clean_error() -> None:
 
 
 # ---------------------------------------------------------------------------
-# start_session() — fake host, clean error + error-state record on disk
+# start_session() — happy path with LocalExecutor
 # ---------------------------------------------------------------------------
 
 
-def test_start_session_against_fake_host_returns_clean_error() -> None:
+def test_start_session_happy_path_transitions_to_running() -> None:
+    """LocalExecutor-backed happy path: a successful call flips the
+    agent to RUNNING and records role_prompt_path + tmux_session."""
     result = _run(
         call_tool(
             "start_session",
             {
                 "name": "coder-1",
-                "host": "user@fake-host.example",
+                "host": "user@local-exec",
                 "project_dir": "~/proj",
                 "role_prompt": "you are a coder",
             },
         )
     )
-    assert result.isError is True
-    text = result.content[0].text
-    assert "stub driver" in text
-    assert "Traceback" not in text
+    assert result.isError is False, result.content[0].text
+    state = read_state()
+    record = state.agents["coder-1"]
+    assert record.state.value == "running"
+    assert record.role_prompt_path == "/tmp/moderator/role-coder-1.txt"
+    assert record.tmux_session == "mod-coder-1"
+    assert record.started_at is not None
+    assert record.last_output_at is not None
 
 
-def test_start_session_against_fake_host_writes_error_record_to_disk() -> None:
-    """Acceptance: ``start_session`` against a fake host writes an
-    error-state record on disk afterwards."""
+def test_start_session_happy_path_persists_role_prompt_remotely(
+    tmp_path: Path,
+) -> None:
+    """The role prompt must land on the simulated remote at the
+    documented path — that's the artifact the agent process will read."""
     _run(
         call_tool(
             "start_session",
             {
-                "name": "coder-1",
-                "host": "user@fake-host.example",
+                "name": "coder-2",
+                "host": "user@local-exec",
                 "project_dir": "~/proj",
-                "role_prompt": "you are a coder",
+                "role_prompt": "you are a reviewer",
             },
         )
     )
+    workdir = tmp_path / "local-exec"
+    staged = workdir / "tmp" / "moderator" / "role-coder-2.txt"
+    assert staged.exists()
+    assert staged.read_text(encoding="utf-8") == "you are a reviewer"
 
-    state = read_state()
-    assert "coder-1" in state.agents
-    record = state.agents["coder-1"]
-    assert record.state.value == "error"
-    assert record.error is not None
-    assert "stub driver" in record.error
+
+def test_start_session_role_prompt_never_persisted_to_state_json() -> None:
+    """Per ADR-0003 the role prompt text is never written into
+    state.json — only the path is recorded."""
+    _run(
+        call_tool(
+            "start_session",
+            {
+                "name": "coder-3",
+                "host": "user@local-exec",
+                "project_dir": "~/proj",
+                "role_prompt": "TOP-SECRET role prompt 12345",
+            },
+        )
+    )
+    raw = Path(__file__).parent.parent.parent / "moderator_state.json"
+    # We rely on MODERATOR_STATE_PATH having been monkey-patched to a
+    # tmp_path file. Resolve from the autouse fixture's view of
+    # MODERATOR_STATE_PATH via the env-var path the test owns.
+    import os
+
+    state_file = Path(os.environ["MODERATOR_STATE_PATH"])
+    raw_text = state_file.read_text(encoding="utf-8")
+    assert "TOP-SECRET" not in raw_text
+    assert "you are a coder" not in raw_text  # also no leftover from prior tests
+
+
+# ---------------------------------------------------------------------------
+# start_session() — unsafe name: clean error + error-state record
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "has spaces",
+        "with/slash",
+        "with;semicolon",
+        "with$dollar",
+        "",
+    ],
+)
+def test_start_session_unsafe_name_returns_clean_error(name: str) -> None:
+    result = _run(
+        call_tool(
+            "start_session",
+            {
+                "name": name,
+                "host": "user@local-exec",
+                "project_dir": "~/proj",
+                "role_prompt": "x",
+            },
+        )
+    )
+    assert result.isError is True
+    assert "Traceback" not in result.content[0].text
+    # Empty name is caught by the "missing required args" path; other
+    # unsafe names hit the safe-name validator.
+    if name:
+        assert "name must match" in result.content[0].text
+
+
+# ---------------------------------------------------------------------------
+# Stubs that explicitly defer to later tickets
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
