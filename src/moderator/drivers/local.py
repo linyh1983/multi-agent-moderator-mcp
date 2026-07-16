@@ -97,6 +97,12 @@ class LocalExecutor:
 
     # ----- SshDriver -----
 
+    def connect(self, host: str | None = None) -> None:
+        """No-op for the in-process simulator. Mirrors
+        :meth:`ParamikoSshDriver.connect` so call sites that wire
+        up a driver pair before the first network call don't have
+        to branch on driver kind. ticket 12 / bug B1."""
+
     def put_file(self, local: Path, remote: str) -> None:
         # ``workdir`` is the simulated remote root (think ``/`` on the
         # agent host). Absolute POSIX paths are joined as if workdir

@@ -1,11 +1,12 @@
 # 12 — SSH connect + ~/.ssh/config resolution (ticket 09 follow-up)
 
-**What to build:** two contract gaps surfaced by manual integration
+**What to build:** contract gaps surfaced by manual integration
 testing against `django-app-openeuler-service-10` on 2026-07-16.
 
-The full bug report lives in `tmp_manual/TEST_PLAN.md` (Bug B1 + B2).
-The `ParamikoSshDriver` lands in ticket 09 (commit `49fac0a`), but
-two contracts that the runtime relies on were never implemented:
+The full bug report lives in `tmp_manual/TEST_PLAN.md`
+(Bug B1 + B2 + B3). The `ParamikoSshDriver` lands in ticket 09
+(commit `49fac0a`), but three contracts that the runtime relies
+on were never implemented:
 
 1. **B1 — `ParamikoSshDriver.connect(host)` is never invoked.**
    `runtime.py` builds the driver in lazy mode (no host) and the
@@ -26,13 +27,25 @@ two contracts that the runtime relies on were never implemented:
    resolves to `hostname=192.168.1.52, user=django-app,
    identityfile=.../django_id_rsa`, but the driver never reads it.
 
+3. **B3 — `client.connect(self._host, **connect_args)` collides on `hostname`.**
+   Discovered during retest of B2's fix on 2026-07-16:
+   `_resolve_ssh_config()` ALWAYS sets `hostname` (falling back to
+   the alias when the config omits `HostName`). The pre-fix code
+   passed `self._host` as a positional arg AND `connect_args`
+   spread the resolved hostname as a kwarg. paramiko's
+   `SSHClient.connect` first parameter is named `hostname`, so the
+   call bound both to the same parameter and raised
+   `TypeError: multiple values for argument 'hostname'`. The fix
+   is to drop the positional and rely on `connect_args` alone.
+
 **Why this matters:** ticket 09's commit message claims
 "ParamikoSshDriver + RemoteTmuxDriver + ssh wiring", but the
 wiring is incomplete — `start_session` against a real remote host
 crashes before any tmux activity. The `MODERATOR_DRIVER=ssh`
-production path is unusable until both fixes land. B1 and B2
-share the same root cause (lazy SSH driver wiring not finished);
-fixing only one still fails end-to-end.
+production path is unusable until all three fixes land. B1, B2,
+B3 form a strict sequence — fixing only the first leaves
+end-to-end broken; fixing B1+B2 but not B3 still crashes at
+the SSH handshake.
 
 **Blocked by:** 09 (driver class exists; needs runtime hookup)
 
@@ -76,35 +89,69 @@ In `src/moderator/drivers/ssh.py:_connect()`, before
 Out of scope for v1: ProxyCommand, Match blocks, Include directives.
 The user's verified dev host (`192.168.1.52`) uses none of these.
 
+### B3 fix — pass host only via kwargs (no positional collision)
+
+In `src/moderator/drivers/ssh.py:_connect()`, change:
+
+```python
+# Before (BUG):
+client.connect(self._host, **connect_args)
+```
+
+to:
+
+```python
+# After (FIX):
+client.connect(**connect_args)
+```
+
+`connect_args` always carries `hostname` (resolver falls back to
+the alias when the config has no `HostName` line). paramiko's
+`SSHClient.connect` first parameter IS named `hostname` — passing
+both the positional alias AND a kwarg would bind both to the
+same parameter → `TypeError: multiple values for argument 'hostname'`.
+
+The fallback path (no `~/.ssh/config` entry → empty dict) still
+works because `connect_args["hostname"]` is set from the alias,
+which is identical to what the positional arg would have carried.
+
 ### Regression tests (must fail before fix, pass after)
 
-Two tests that would have caught this:
+Three tests that would have caught this:
 
-1. **`tests/tools/test_start_session.py:test_start_session_via_ssh_invokes_connect`**
+1. **`tests/tools/test_start_session_ssh_wiring.py:test_start_session_via_ssh_invokes_connect`** (B1)
    — drive `call_tool("start_session", ...)` against a
    `RecordingSshDriver` that captures every method call. Assert
    `connect(host=...)` is called before `put_file` and `run`,
    and that the host argument matches the per-agent host.
 
-2. **`tests/drivers/test_ssh.py:test_paramiko_driver_resolves_ssh_config_alias`**
-   — write a fake `~/.ssh/config` to a tmp dir, point
-   `SSH_CONFIG_PATH` at it (or monkey-patch), construct
-   `ParamikoSshDriver()` with the alias, call `connect(alias)`,
-   and assert the underlying `paramiko.SSHClient.connect` was
-   called with the resolved `hostname=192.168.1.52`,
-   `username=django-app`, `port=22`, `key_filename=<absolute path>`.
-   Use the standard `mock.patch("paramiko.SSHClient.connect")`
-   pattern.
+2. **`tests/drivers/test_ssh_config_resolution.py:test_paramiko_driver_resolves_ssh_config_alias`** (B2)
+   — write a fake `~/.ssh/config` to a tmp dir, monkey-patch
+   `SSHConfig.from_path`, construct `ParamikoSshDriver()` with
+   the alias, call `connect(alias)`, and assert the underlying
+   `paramiko.SSHClient.connect` was called with the resolved
+   `hostname=192.168.1.52`, `username=django-app`,
+   `port=22`, `key_filename=<absolute path>`.
+   Plus two companion tests covering the no-config fallback and
+   `IdentityFile` tilde expansion.
 
-The integration assertion that proves both fixes work is the
-manual `R2-S1` step in `tmp_manual/TEST_PLAN.md`: a real
+3. **`tests/drivers/test_ssh_config_resolution.py:test_paramiko_driver_does_not_pass_hostname_twice`** (B3)
+   — same harness as #2, with a populated SSH config. Assert
+   that `client.connect` was called WITHOUT positional args (the
+   host appears only via `kwargs["hostname"]`). This locks down
+   the call shape so any future regression that re-introduces a
+   positional alias is caught immediately.
+
+The integration assertion that proves all three fixes work is
+the manual `R2-S1` step in `tmp_manual/TEST_PLAN.md`: a real
 `mcp__moderator__start_session` call against
 `django-app-openeuler-service-10` returns `isError=false`.
 
 ## Acceptance
 
-- `tests/tools/test_start_session.py::test_start_session_via_ssh_invokes_connect` passes
-- `tests/drivers/test_ssh.py::test_paramiko_driver_resolves_ssh_config_alias` passes
-- All existing 281+ tests still green
+- `tests/tools/test_start_session_ssh_wiring.py::test_start_session_via_ssh_invokes_connect` passes
+- `tests/drivers/test_ssh_config_resolution.py::*` (4 tests) pass
+- All existing 281+ tests still green (2 known failures in
+  `test_local.py` are pre-existing and out of scope)
 - `mypy` clean on the touched modules
 - Manual `R2-S1` through `R2-S8` from `tmp_manual/TEST_PLAN.md` complete against `django-app-openeuler-service-10`

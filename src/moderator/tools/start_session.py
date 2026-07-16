@@ -197,6 +197,15 @@ async def _start_one(
         remote_role = _remote_role_path(name)
         session = _tmux_session(name)
 
+        # 0. Wire up the SSH driver to the per-agent host. The
+        # runtime builds ParamikoSshDriver in lazy mode (no host
+        # at construction), so the caller MUST invoke connect(host)
+        # before the first network call. connect() is idempotent
+        # (no-op when the driver is already connected), so calling
+        # it here is safe even if a future change constructs the
+        # driver eagerly. ticket 12 / bug B1.
+        ssh.connect(host)
+
         # 1. Push the role prompt to the agent host. put_file is
         # required to create parent directories (LocalExecutor does;
         # real SSH drivers will too).

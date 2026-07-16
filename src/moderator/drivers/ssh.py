@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Any
 
 import paramiko
 
@@ -111,14 +112,29 @@ class ParamikoSshDriver:
 
     def _connect(self) -> None:
         """Open the SSH connection. Called from :meth:`__init__` (when
-        host was supplied) and from :meth:`connect` (lazy mode)."""
+        host was supplied) and from :meth:`connect` (lazy mode).
+
+        Resolves ``self._host`` through ``~/.ssh/config`` so the
+        alias (``django-app-openeuler-service-10``) becomes its
+        concrete ``hostname / username / port / IdentityFile``
+        tuple. paramiko's SSHClient does NOT consult ssh_config on
+        its own — we have to do it. ticket 12 / bug B2.
+        """
         assert self._host is not None  # callers gate on this
         client = paramiko.SSHClient()
         # TOFU per ADR-0015: first connection proceeds; future
         # iterations may consult a fingerprint allowlist.
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        connect_args = self._resolve_ssh_config(self._host)
         try:
-            client.connect(self._host)
+            # ``connect_args`` always carries a ``hostname`` key
+            # (falling back to the alias). paramiko's
+            # ``SSHClient.connect`` first parameter is named
+            # ``hostname`` — passing ``self._host`` as a positional
+            # too would bind BOTH to that parameter and raise
+            # ``TypeError: multiple values for argument 'hostname'``.
+            # ticket 12 / bug B3.
+            client.connect(**connect_args)
         except paramiko.AuthenticationException as exc:
             raise DriverError(
                 f"ParamikoSshDriver({self._host!r}): auth failed: {exc}"
@@ -132,6 +148,47 @@ class ParamikoSshDriver:
                 f"ParamikoSshDriver({self._host!r}): connection error: {exc}"
             ) from exc
         self._client = client
+
+    @staticmethod
+    def _resolve_ssh_config(host: str) -> dict[str, Any]:
+        """Look up ``host`` in ``~/.ssh/config`` and return the
+        kwargs to hand to :meth:`paramiko.SSHClient.connect`.
+
+        Returns an empty dict if the host is not configured (no
+        ``Host`` block matches) — in that case paramiko's defaults
+        apply (raw hostname, current local user, agent + common
+        keys). v1 scope: Host / HostName / User / Port / IdentityFile
+        only. ProxyCommand / Match / Include are out of scope.
+        """
+        config_path = Path.home() / ".ssh" / "config"
+        try:
+            ssh_cfg = paramiko.config.SSHConfig.from_path(config_path)
+        except OSError:
+            return {}
+        cfg = ssh_cfg.lookup(host)
+        if not cfg:
+            return {}
+        out: dict[str, Any] = {}
+        # HostName — fall back to the alias if the config omits it.
+        out["hostname"] = cfg.get("hostname", host)
+        if "user" in cfg:
+            out["username"] = cfg["user"]
+        if "port" in cfg:
+            try:
+                out["port"] = int(cfg["port"])
+            except ValueError:
+                pass
+        # IdentityFile is a list — take the first; expand ~ and
+        # normalize to an absolute path so paramiko (which does
+        # not always handle ``~``) sees a clean filesystem path.
+        identity = cfg.get("identityfile")
+        if identity:
+            key_str = identity[0]
+            key_path = Path(key_str).expanduser()
+            if not key_path.is_absolute():
+                key_path = (Path.home() / key_path).resolve()
+            out["key_filename"] = str(key_path)
+        return out
 
     # ------------------------------------------------------------------
     # SshDriver protocol

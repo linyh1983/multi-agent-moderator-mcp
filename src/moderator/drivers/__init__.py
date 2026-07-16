@@ -41,6 +41,18 @@ class SshDriver(Protocol):
     (ADR-0015); the moderator does not validate host keys itself.
     """
 
+    def connect(self, host: str | None = None) -> None:
+        """Wire the driver up to ``host``.
+
+        Implementations that build their connection eagerly at
+        construction time treat this as a no-op. Implementations
+        that defer connection (e.g. ``ParamikoSshDriver`` in lazy
+        mode) open the connection here. The runtime calls this
+        before the first ``put_file`` / ``run`` so lazy drivers
+        do not see ``not connected`` errors. Idempotent.
+        ticket 12 / bug B1.
+        """
+
     def put_file(self, local: Path, remote: str) -> None:
         """Copy ``local`` to ``remote`` on the host. May create dirs."""
         ...

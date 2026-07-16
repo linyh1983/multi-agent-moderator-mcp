@@ -305,8 +305,17 @@ def test_connect_uses_auto_add_policy() -> None:
     with patch("moderator.drivers.ssh.paramiko.SSHClient") as ClientCls:
         client = ClientCls.return_value
         d = ParamikoSshDriver(host="some-new-host.example.com")
-        # Construction triggers connect().
-        client.connect.assert_called_once_with("some-new-host.example.com")
+        # Construction triggers connect(). The driver always passes
+        # the host via ``hostname=<alias>`` kwarg (the resolver
+        # falls back to the alias when no HostName line is present);
+        # never positionally, to avoid colliding with any other
+        # ``hostname`` that may already be in the resolved kwargs.
+        # ticket 12 / bug B3.
+        client.connect.assert_called_once()
+        assert (
+            client.connect.call_args.kwargs.get("hostname")
+            == "some-new-host.example.com"
+        )
         # Policy was set BEFORE connect.
         assert client.set_missing_host_key_policy.called
 
@@ -331,13 +340,34 @@ def test_lazy_construct_does_not_connect() -> None:
 
 def test_lazy_connect_opens_ssh_session_with_supplied_host() -> None:
     """A driver constructed without a host calls ``connect(host)`` to
-    open the session — the runtime path for first-time ``start_session``."""
+    open the session — the runtime path for first-time ``start_session``.
+
+    When the host is in ``~/.ssh/config`` (the dev host is), the
+    driver passes the resolved kwargs through to
+    :meth:`paramiko.SSHClient.connect`. We only assert the resolved
+    hostname is present in kwargs here; full resolution coverage
+    lives in ``tests/drivers/test_ssh_config_resolution.py``
+    (ticket 12)."""
     with patch("moderator.drivers.ssh.paramiko.SSHClient") as ClientCls:
         client = ClientCls.return_value
         d = ParamikoSshDriver()
         assert d._client is None
         d.connect(host="django-app-openeuler-service-10")
-        client.connect.assert_called_once_with("django-app-openeuler-service-10")
+        # The host is always passed via the ``hostname`` kwarg — never
+        # positionally — to avoid colliding with any resolved hostname
+        # in the SSH config (ticket 12 / bug B3). The actual VALUE
+        # depends on the user's real ``~/.ssh/config`` and is exercised
+        # by ``test_ssh_config_resolution.py``.
+        hostname_kw = client.connect.call_args.kwargs.get("hostname")
+        assert hostname_kw, (
+            f"hostname kwarg must be set, got {client.connect.call_args!r}"
+        )
+        # The resolved hostname must be the only place the host
+        # appears — no positional alias leak.
+        assert not client.connect.call_args.args, (
+            "connect() must not take positional args; that collides "
+            "with kwargs['hostname'] in paramiko. ticket 12 / bug B3."
+        )
         # TOFU policy applied at _connect time.
         assert client.set_missing_host_key_policy.called
         # And the driver now points at the live client.
@@ -354,8 +384,18 @@ def test_connect_is_idempotent_when_already_connected() -> None:
         d.connect(host="some-other-host.example.com")  # ignored
         d.connect()  # also ignored
         # The underlying SSHClient.connect is called exactly once —
-        # from __init__.
-        client.connect.assert_called_once_with("django-app-openeuler-service-10")
+        # from __init__. The host is carried as the ``hostname``
+        # kwarg; never positionally (ticket 12 / bug B3). The actual
+        # value depends on the user's real ``~/.ssh/config``; see
+        # ``test_ssh_config_resolution.py`` for resolution coverage.
+        client.connect.assert_called_once()
+        hostname_kw = client.connect.call_args.kwargs.get("hostname")
+        assert hostname_kw, (
+            f"hostname kwarg must be set, got {client.connect.call_args!r}"
+        )
+        assert not client.connect.call_args.args, (
+            "connect() must not take positional args. ticket 12 / bug B3."
+        )
 
 
 def test_connect_raises_driver_error_when_no_host_ever_supplied() -> None:
