@@ -265,25 +265,24 @@ def test_start_session_unsafe_name_returns_clean_error(name: str) -> None:
 @pytest.mark.parametrize(
     "tool, args",
     [
-        # ticket 04 made approve/reject real. Without an empty
-        # state they should return a clean error (no traceback).
+        # ticket 04 made approve/reject real; ticket 10 made
+        # cue real. Without seeded state they should each return
+        # a clean error (no traceback) describing WHY, rather than
+        # blanket "not implemented".
         ("approve", {"action_ids": ["a-1"]}),
         ("reject", {"action_ids": ["a-1"], "reason": "nope"}),
-        # cue still defers to a later ticket.
         ("cue", {"target": "coder-1", "message": "ping"}),
     ],
 )
-def test_stub_tools_return_not_implemented(tool: str, args: dict) -> None:
+def test_stub_tools_return_clean_error_when_state_empty(tool: str, args: dict) -> None:
     result = _run(call_tool(tool, args))
     assert result.isError is True
     text = result.content[0].text
     assert "Traceback" not in text
-    if tool == "cue":
-        # cue is still a stub.
-        assert "not implemented" in text
-    else:
-        # approve/reject report a real error (missing action ids).
-        assert tool in text
+    # Real validation message — names the tool and the specific
+    # reason. (Replaces the old "not implemented" assertion once
+    # the cue stub landed in ticket 10.)
+    assert tool in text
 
 
 def test_stop_session_against_empty_state_returns_clean_error() -> None:
