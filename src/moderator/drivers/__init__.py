@@ -11,10 +11,10 @@ Public surface:
   implementation must satisfy.
 - :class:`LocalExecutor`: in-process subprocess-backed
   implementation. Always available.
-- :class:`ParamikoSshDriver` / :class:`LibtmuxDriver`: real
-  production drivers. Available only with the relevant optional
-  dep installed. Construction raises :class:`DriverMissing`
-  if the dep is absent.
+- :class:`ParamikoSshDriver`: real SSH driver (paramiko-backed).
+- :class:`RemoteTmuxDriver`: tmux-over-SSH; delegates to an
+  :class:`SshDriver` and raises if the dependency is absent at
+  import time.
 """
 
 from __future__ import annotations

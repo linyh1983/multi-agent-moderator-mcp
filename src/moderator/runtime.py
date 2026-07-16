@@ -10,8 +10,9 @@ Selection rules:
 - ``MODERATOR_DRIVER=local``  → :class:`LocalExecutor` (default
   for the test suite; also useful for single-host development).
 - ``MODERATOR_DRIVER=ssh``    → :class:`ParamikoSshDriver` +
-  :class:`LibtmuxDriver`. Raises :class:`DriverMissing` if the
-  optional dependencies aren't installed.
+  :class:`RemoteTmuxDriver`. The SshDriver is constructed in
+  lazy mode (no host) — the runtime calls ``connect(host)`` at
+  ``start_session`` time when the per-agent host is known.
 
 Swapping drivers at runtime is supported via :func:`set_drivers`
 and is the recommended way for tests to inject a fixture.
@@ -43,12 +44,21 @@ def get_drivers() -> tuple[SshDriver, TmuxDriver]:
     if choice == "local":
         execu = LocalExecutor()
         _ssh, _tmux = execu, execu
-    elif choice in ("ssh", "tmux"):
-        # Real drivers. Defer the import so the test env doesn't
-        # have to install paramiko/libtmux.
-        from moderator.drivers.ssh import ParamikoSshDriver  # type: ignore[import-not-found]  # noqa
-        from moderator.drivers.tmux_lib import LibtmuxDriver  # type: ignore[import-not-found]  # noqa
-        _ssh, _tmux = ParamikoSshDriver(), LibtmuxDriver()
+    elif choice == "ssh":
+        # Real remote drivers. Defer the import so the test env
+        # doesn't have to install paramiko.
+        #
+        # ``ParamikoSshDriver()`` is constructed in lazy mode —
+        # no host is known at process startup. The runtime calls
+        # ``connect(host)`` at ``start_session`` time. The tmux
+        # driver delegates to the (lazily-connected) SSH driver,
+        # so tmux sessions aren't opened until the agent host is
+        # pinned.
+        from moderator.drivers.ssh import ParamikoSshDriver
+        from moderator.drivers.tmux_remote import RemoteTmuxDriver
+
+        _ssh = ParamikoSshDriver()
+        _tmux = RemoteTmuxDriver(exec_via=_ssh)
     else:
         raise DriverMissing(f"unknown MODERATOR_DRIVER: {choice!r}")
     return _ssh, _tmux
