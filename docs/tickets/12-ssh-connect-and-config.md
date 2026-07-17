@@ -50,9 +50,14 @@ the SSH handshake.
 **Blocked by:** 09 (driver class exists; needs runtime hookup)
 
 **References:** issues/9 (original ticket 09), tmp_manual/TEST_PLAN.md
-(B1 + B2 sections).
+(B1 + B2 + B3 sections).
 
-**Status:** ready-for-agent
+**Follow-up:** ticket 13 / bug B4 — `--role-file` is not a real
+Claude Code CLI flag; the agent process exits rc=1 immediately,
+blocking R2-S1 in a different way. See
+`docs/tickets/13-agent-cli-flag.md`.
+
+**Status:** shipped (commit `353fb2c` on `main`; GitHub issue #12 closed)
 
 ## Scope
 

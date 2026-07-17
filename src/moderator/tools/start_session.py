@@ -162,11 +162,21 @@ def _record_failure(
 
 def _build_agent_command(remote_role_path: str, project_dir: str) -> str:
     """Build the tmux ``command`` string. Per ADR-0003 the agent
-    process owns its role; we paste-buffer the role prompt so it
-    sees it as the first input."""
+    process owns its role; we stage the role prompt to a file on
+    the agent host and point the agent at it via ``--system-prompt-file``.
+
+    ``--system-prompt-file`` replaces Claude Code's default system
+    prompt with the file's contents — matches ADR-0003's "agent
+    process owns its role" principle. (Earlier this code used the
+    invented ``--role-file`` flag, which is not a real Claude Code
+    CLI flag — see ticket 13 / bug B4. The agent exited rc=1
+    immediately, tmux destroyed the session, and the next
+    ``paste_buffer`` step failed with a misleading
+    ``can't find pane: mod-...`` error.)
+    """
     # Quoting: project_dir is treated as a shell path; the role
-    # prompt itself is pasted via paste_buffer (separate channel).
-    return f"cd {shlex_quote(project_dir)} && {_AGENT_BIN} --role-file {shlex_quote(remote_role_path)}"
+    # path is the file Claude Code will read.
+    return f"cd {shlex_quote(project_dir)} && {_AGENT_BIN} --system-prompt-file {shlex_quote(remote_role_path)}"
 
 
 def shlex_quote(s: str) -> str:
